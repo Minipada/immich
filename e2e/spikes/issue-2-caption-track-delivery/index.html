@@ -1,0 +1,19 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Spike: caption track delivery</title></head>
+<body>
+  <h1>Spike: caption track delivery (issue #2)</h1>
+
+  <h2>hls-video (realtime transcoding path)</h2>
+  <hls-video id="hls-video-el" controls style="width: 480px; height: 270px; display: block; background: #000;">
+    <track kind="subtitles" src="/spike-test.vtt" srclang="en" label="English" default>
+  </hls-video>
+
+  <h2>plain video (non-HLS fallback path)</h2>
+  <video id="plain-video-el" src="https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4" controls style="width: 480px; height: 270px; display: block; background: #000;">
+    <track kind="subtitles" src="/spike-test.vtt" srclang="en" label="English" default>
+  </video>
+
+  <script type="module" src="/bundle.js"></script>
+</body>
+</html>
