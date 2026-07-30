@@ -1,66 +1,115 @@
-Issue #4: Performance gate: measure model throughput and confirm model choice
+Issue #5: Silence-aligned chunking, resumption, and progressive transcripts
 
-Measured whether faster-whisper-small at int8 is fast enough on target
-hardware to keep automatic subtitles worth having, and applied the issue's
-decision rule. Gate CLOSED: the model selection stands, no escalation.
+Replaced the tracer bullet's whole-file extraction with a chunked pipeline
+that survives interruption and whose partial output is readable while the
+job is still running. All ten acceptance criteria are covered.
 
-Benchmark harness (machine-learning/scripts/benchmark_transcription.py):
-- Drives the production `WhisperTranscriber` and the server's exact audio
-  extraction flags (`-vn -ac 1 -ar 16000 -f wav`, mirroring
-  `MediaRepository.extractAudio`), so it measures the path the job queue
-  takes rather than a hand-tuned best case.
-- Reports throughput as a ratio against real time, loaded-model RSS,
-  VAD-detected speech seconds, and a VAD-on/VAD-off comparison. Exits
-  non-zero below the 2x threshold so the gate is mechanical.
-- Documented under a new "Transcription Throughput" section in
-  machine-learning/README.md.
+Chunking (server/src/utils/transcription.ts, media.repository.ts):
+- Audio is decoded once to raw 16 kHz mono signed 16-bit PCM, with ffmpeg's
+  `silencedetect` filter riding along on the same decode pass. A second
+  pass over a long file costs as much as the first, so detection is not
+  worth separating.
+- `planChunks` walks from zero in steps of the target duration and moves
+  each boundary to the middle of the nearest silence within a +/-5s window,
+  clamping the silence to the window first. The midpoint is the point
+  furthest from speech on either side, which leaves the most room for the
+  imprecision in where detection places its edges. No qualifying silence
+  means a hard cut at the target.
+- Deterministic by construction: it sorts its input and breaks distance
+  ties toward the earlier candidate, so boundaries do not depend on the
+  order ffmpeg happened to report silences in. A unit test asserts a
+  reversed silence list plans identically.
+- The loop stops splitting once the remainder fits in one chunk, so the
+  last chunk absorbs the tail rather than leaving a sliver behind it.
+- A silence still open at end of stream is reported as ending at Infinity
+  and clamped by the planner, rather than being dropped.
 
-Hardware: Intel i7-8650U (2018 mobile, 4c/8t), 23 GiB RAM, CPU only, at the
-server's default 4 threads and queue concurrency 1. Load average 5.9-6.5
-during runs, so the numbers are a floor rather than a best case.
+Resumption (transcript.repository.ts, asset-job-status.table.ts):
+- `appendChunk` writes a chunk's segments and the progress marker it
+  advances to in a single transaction. Splitting them would let a crash in
+  between leave rows for a chunk that is then re-run.
+- Progress lives in a new `asset_job_status.transcriptionProgressMs`
+  column (migration 1785419018640) as a millisecond offset, not a chunk
+  index. Indices are not stable across runs: change the chunk size or the
+  silence thresholds between a failure and its retry and a given index
+  denotes a different region.
+- `planResume` drops chunks the offset already covers and clips the chunk
+  that straddles it back to the offset. Skipping to the next boundary
+  instead — the literal reading of "start at the first boundary at or
+  beyond the offset" — would silently drop the audio between the offset and
+  that boundary whenever re-planning moved it. Clipping is the only
+  version that produces neither duplicates nor gaps; a remainder under
+  0.25s is dropped because it cannot hold a word.
+- A chunk that VAD finds no speech in still advances progress, so it is not
+  replayed on every resume.
+- `reset` (fresh run) and `deleteAll` (forced re-queue) clear segments and
+  the marker together.
 
-Results (production config, VAD on):
-- Amateur vlog, 940s, 88.6% speech ......  3.97x real time
-- Wedding montage, 689s, 0% speech ...... 127.58x real time
-- LibriVox chapter, 553s, 97.9% speech ..   3.51x real time
-Three independent repetitions; worst production observation anywhere 2.88x,
-still 44% above the 2x threshold.
+Progressive display:
+- `getStatus` reads progress without gating on completion. Three states,
+  each with a consumer: never started drives the queue-all stream and the
+  fresh-run reset; in flight drives the resume planner and keeps the web
+  client polling; complete stops both.
+- The captions endpoint carries the state in WebVTT `NOTE` blocks. Players
+  ignore notes, so a partial transcript renders as a caption track exactly
+  like a finished one, and no new endpoint or DTO was needed.
+- The web player refetches the track every 15s into a blob URL while the
+  video is open, reasserting `mode = 'showing'` on each load because a
+  track element resets to disabled when its source is replaced. It stops
+  once the transcript is marked complete.
 
-Model memory footprint: 397 MiB RSS over a ~261 MiB interpreter baseline,
-reproducible to 0.1 MiB across three clips and five isolated repetitions.
-Peak process RSS during transcription scales with clip length: 940 MiB at
-689s, 1458 MiB at 940s.
+Inference timeout (machine-learning.repository.ts):
+- `predict` gained an optional `timeout`, supplied only by transcription,
+  so every other caller keeps waiting indefinitely as before.
+- The value is `chunkDuration * timeoutMultiplier`, defaulting to 30x, with
+  a 60s floor so first-use model loading (which downloads ~500 MB) is not
+  mistaken for a hang. Against the 3.5x worst case measured in issue #4's
+  performance gate, 30x is roughly an order of magnitude of headroom.
+- Failover is unchanged. Because progress is persisted per chunk, a timeout
+  costs at most one chunk of duplicated inference.
 
-Effect of VAD: 65.5x faster on the music-only montage (VAD eliminates 100%
-of decode work), 1.28x on the talking-heavy vlog, 1.19x on continuous
-speech. Two findings worth keeping: with VAD off the montage drops to
-1.95x, the only sub-threshold figure measured anywhere, so VAD is
-load-bearing rather than an optimisation; and with VAD off the model
-hallucinates over non-speech, emitting 24 segments across a clip that
-contains none. `vad_filter=True` is a correctness measure as much as a
-performance one.
+ML side: chunks arrive as raw PCM rather than a WAV container. At chunk
+scale compression buys nothing, while raw removes a decode dependency and
+is byte-identical to what faster-whisper feeds its encoder. The transcriber
+converts int16 to normalised float32 and ignores a trailing odd byte, which
+cannot form a sample.
 
-Why the gate is closed on a bound rather than an anecdote: decode cost
-tracks detected speech seconds, not media duration. The clips fit
-`wall ~ 0.0078 x duration + speech_seconds / 3.5` (the zero-speech montage
-isolates the VAD scan cost; the two speech-bearing clips agree to within 3%
-on decode rate). Since no video exceeds 100% speech, the floor is ~3.4x, and
-every personal video — having less speech to decode — sits above it.
+Config: `machineLearning.transcription` gained `chunkDuration` (30s,
+5..600) and `timeoutMultiplier` (30, min 1). OpenAPI spec and the
+TypeScript SDK client were regenerated.
 
-On test material: the issue asks for representative personal video, not a
-continuous-speech clip. That proved to be the hard part. Of four archive.org
-candidates, one had no audio stream, one had an AAC track carrying no
-signal, and the 11.5-minute amateur wedding video — genuine audio, RMS 0.081
-— contains zero VAD-detected speech end to end. It is kept in the set
-because it is real and representative, not despite it. The continuous-speech
-clip is included precisely because it measures the conservative direction.
+Tests:
+- 22 unit tests on the planners covering short audio, no silences, silence
+  exactly spanning the target, a silence overrunning the window, an
+  unterminated trailing silence, determinism, and gap/overlap-free
+  coverage; plus byte-range, duration and timeout maths.
+- 16 unit tests on the service covering chunk splitting at silences,
+  segment time offsetting, timeout scaling, resumption, zero-speech
+  progress, and the already-complete no-op.
+- 9 medium tests against a real Postgres covering per-chunk atomicity (a
+  failing insert leaves neither partial rows nor advanced progress), the
+  three status states, reset/deleteAll, and duplicate-free resumption both
+  with a stable boundary set and with one that changed between runs.
+- Full server unit suite green (2288 passed). ML suite green (108 passed).
+  Server lint/format/typecheck and web lint/format/svelte-check green.
 
-Recorded in machine-learning/docs/transcription-performance-gate.md, with
-raw per-clip measurements in machine-learning/docs/transcription-gate-results/.
-
-Not done: single host, CPU only. A NAS-class Celeron or low-end ARM board
-could plausibly fall below 2x and is not covered; anyone targeting such
-hardware should re-run the harness. Only English-language material was
-measured. No chunking of long audio was added — peak RSS of ~1.5 GiB on a
-15-minute video is the strongest argument for the chunking the tracer bullet
-deferred, but that is a separate slice.
+Not done / caveats:
+- The medium-test harness could not start its own database here:
+  testcontainers fails against this host's Docker 29.5 with "Log stream
+  ended", on a clean checkout as much as on this branch. The medium tests
+  were run against a manually started `ghcr.io/immich-app/postgres` with
+  `IMMICH_TEST_POSTGRES_URL` pointed at it, and all 9 new tests pass. Two
+  unrelated medium suites (exif, workflow-core-plugin) fail in this
+  environment for want of exiftool and a built plugin-core.
+- The Dart SDK was not regenerated: `openapi-generator-cli` is unavailable
+  here, and `mobile/openapi` already lacked `TranscriptionConfig` from the
+  tracer bullet, so this branch does not make it any staler.
+- `src/queries/*.sql` was not regenerated either, matching what the tracer
+  bullet did; those snapshots are already stale for the transcription
+  repositories.
+- Chunking is planned but end-to-end behaviour on a real long video was not
+  measured. Issue #4 noted peak RSS of ~1.5 GiB on a 15-minute video as the
+  argument for chunking; confirming the new ceiling is worth a follow-up.
+- Silence thresholds (-30 dBFS, 0.25s) and the +/-5s search window are
+  constants, not configuration. They are the knobs most likely to need
+  tuning on unusual material.
