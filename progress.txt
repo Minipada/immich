@@ -1,139 +1,111 @@
-Issue #6: Per-window language detection with sticky resolution
+Issue #7: Quality signals and read-time hallucination filtering
 
-Language is detected continuously instead of once per video, each stored
-segment carries its resolved language, and an administrator can force a
-single language across the library. All eight acceptance criteria are
-covered, including the end-to-end one — a real two-switch video was built
-and transcribed (results below).
+Every segment now carries three signals from the model, every segment is
+stored whatever they say, and the caption track excludes the failures when
+it is read. All eight acceptance criteria are covered.
 
-ML side (immich_ml/models/transcription/whisper.py):
-- `multilingual` was already on from the tracer bullet, so faster-whisper
-  re-decides the language at every 30s encoder window. It does not expose
-  that decision, and `Segment` has no language field in 1.2.1, so detection
-  is repeated through the public `detect_language` API and each segment is
-  labelled by the window its midpoint falls in.
-- Repeating it costs one extra encoder pass per window. Windows are
-  therefore detected lazily and shared between every segment in them, so a
-  window with ten segments is detected once and a window with none — music,
-  silence, anything VAD dropped — is never detected at all.
-- The midpoint, not the start, picks the window, so a segment straddling a
-  boundary is labelled by the window it mostly belongs to. The index is
-  clamped to the last window that exists, because a model can report past
-  the end of the audio it was given.
-- Confidence is passed through raw. Deciding whether to believe a switch is
-  the server's job, so the adapter stays a thin reporter.
-- A configured override is passed as `language=` and turns `multilingual`
-  off, so the model does not detect at all. Overridden segments report
-  confidence 1.0, which makes the server's stickiness rule a no-op rather
-  than a special case. `configure()` applies a changed override to an
-  already-cached model, which is the only way options reach one.
+ML side (immich_ml/models/transcription/whisper.py, schemas.py):
+- `no_speech_prob`, `avg_logprob` and `compression_ratio` are already on
+  every faster-whisper segment; they are passed through as decoded, under
+  the same names the rest of the transcript uses.
+- Passed through, not acted on. faster-whisper applies thresholds of its
+  own while decoding, but only to pick a temperature to retry at — it
+  emits the segment either way. The adapter stays a reporter for the same
+  reason it does with language confidence: the decision is the server's.
 
-Stickiness (server/src/utils/transcription.ts, `resolveSegmentLanguages`):
-- Believe a detection at or above `minLanguageConfidence`; below it the
-  segment keeps the language established so far.
-- Because an unsure segment resolves to the established language rather than
-  to its own detection, the established language moves only on a confident
-  detection. That is what makes a run of unsure segments unable to drift:
-  the invariant is structural, not a length limit. It also makes the last
-  resolved language the established one, which is what the caller carries
-  into the next chunk.
-- At the threshold exactly the detection is believed. The setting reads as
-  the confidence required, so requiring strictly more would be off by one
-  detection's worth of hesitation.
-- The first segment of the first chunk is the only one with nothing to
-  inherit and keeps its own detection whatever the confidence — a guess
-  beats no language, and the first confident detection after it takes over.
+The filter (server/src/utils/transcription.ts, `filterHallucinations`):
+- Discard when no-speech probability is above its threshold AND average
+  log-probability is below its own. Either alone has an innocent reading —
+  a high no-speech probability also describes quiet but genuine speech, a
+  low log-probability also describes speech the model found hard (an
+  accent, a crowd, a bad microphone) — so pairing them is what stops the
+  rule firing on real speech. Together they say the model neither heard
+  speech nor believed what it wrote down.
+- Discard when compression ratio is above its threshold, on that signal
+  alone. Compression ratio is text length over compressed size, so nothing
+  but a repetition loop reaches a high value; there is no innocent reading
+  to pair it against.
+- At a threshold exactly the segment is kept. The settings read as the
+  worst still tolerated, so discarding at the boundary would be off by one.
+  Same reasoning as `minLanguageConfidence` in issue #6, opposite direction.
+- No phrase blocklist, as the issue specifies. It would be per-language,
+  unbounded, and a maintenance treadmill; the numbers identify the same
+  segments for a reason that holds in every language.
+- A segment whose signals are null is kept. Null means "written before this
+  change", not "scored zero" — judging on a missing number would silently
+  blank every transcript made before this branch. The paired rule needs
+  both signals present, so a half-recorded segment is kept too.
 
-Carrying it across boundaries (transcription.service.ts, transcript.repository.ts):
-- The established language is threaded from chunk to chunk in memory, and
-  read back from the last written segment (`getLastLanguage`, ordered by
-  start time, not insertion order) when a run resumes. Without the read-back
-  the first segment after a restart would look like a first segment and
-  could re-anchor the transcript on a misdetection.
-- A chunk with no speech leaves the established language untouched rather
-  than clearing it, so music between two people talking does not reset it.
+Read time, not ingest (asset.service.ts, transcription.service.ts):
+- `transcribeChunk` writes every segment the model returned, signals
+  included, and never inspects them.
+- `getCaptions` reads the config alongside the segments and filters there.
+  Changing a threshold changes what the next request renders; nothing is
+  re-transcribed. That is the one-way-door argument from the issue: rows
+  can be re-derived into a caption track, but inference discarded has to be
+  re-run across the whole library to get back.
+- Search is not touched. The issue names it as a later slice.
 
 Schema and config:
-- `transcript_segment.language`, nullable text (migration 1785426524830).
-  Nullable only because segments written before this change have none.
-  Per-segment rather than per-asset: WebVTT scopes language at track level
-  so it cannot be declared per cue, and a mixed transcript renders fine in
-  one track, but storing it per segment makes per-language tracks a
-  rendering change later rather than a schema change.
-- `machineLearning.transcription.language` (null = detect; validated as a
-  2-3 letter code, which covers every Whisper code including `yue`) and
-  `minLanguageConfidence` (0.7, range 0..1). OpenAPI spec and the TypeScript
-  SDK client regenerated; SQL query snapshots regenerated.
-- No administrator UI: issue #13 covers transcription settings, and the
-  earlier chunking settings were added the same way.
-
-End-to-end verification (the acceptance criterion that needed real audio):
-- Built a 135s video from two public-domain LibriVox recordings — 45s
-  English, 45s French, 45s English — so there are two switches with known
-  ground truth, then ran the production path: the server's exact ffmpeg
-  extraction flags, the same chunk plan, the real `WhisperTranscriber`, and
-  the real `resolveSegmentLanguages` over its output.
-- The text is correct in both languages across both switches. French is
-  transcribed as French, English as English, with no phonetic transliteration
-  anywhere.
-- Detected boundaries at the 0.7 default: en 0-29.5s, fr 29.5-90.0s, en
-  90.1-135.0s, against a truth of 0-45 / 45-90 / 90-135.
-- The 15.5s error on the first boundary is window granularity, not
-  stickiness. The window spanning 29.5-58.7s contains both languages and
-  reads as French at 0.790 — every single-language window scored 0.985 to
-  1.000, so the confidence drop lands exactly where the ambiguity is. At a
-  0.8 threshold that window is disbelieved and the same boundary lands
-  13.6s late in the other direction; no threshold fixes it, because the
-  window genuinely is half of each. The second boundary, which falls on a
-  chunk edge, is exact.
-- That spread also brackets the default usefully: 0.7 is low enough to
-  accept a genuine switch (French windows scored 0.985) and high enough to
-  reject the ambiguous one at 0.790. Raised to 0.99 the resolver never
-  believes the switch at all and holds English for the whole video, which is
-  what an over-strict threshold buys.
-- Override checked on the same audio: forcing `en` over the French section
-  yields English text ("without other shelter than the vote of the gods"
-  for "sans autres abris que la voûte des cieux"), confirming detection is
-  genuinely off rather than merely overruled, and that `configure()` applies
-  to a loaded model.
+- `transcript_segment.noSpeechProbability`, `avgLogProbability`,
+  `compressionRatio`, all nullable `real` (migration 1785447598281).
+  Nullable only for segments written before this change. Written by hand
+  because the build was broken here (see caveats), then verified: the
+  migration applies cleanly and `migrations:generate` afterwards reports
+  "No changes detected", so it matches the table definition exactly.
+- `machineLearning.transcription.maxNoSpeechProbability` (0.6),
+  `minAvgLogProbability` (-1), `maxCompressionRatio` (2.4). These are
+  Whisper's own decoding defaults, which is the only calibration anyone has
+  for these three numbers; nothing here argues for departing from them
+  before there is evidence.
+- OpenAPI spec, TypeScript SDK client and SQL query snapshots regenerated.
+- No administrator UI: issue #13 covers transcription settings, same as the
+  chunking and language settings before it.
 
 Tests:
-- 9 unit tests on the resolver: confident switch, low-confidence
-  inheritance, first segment, sustained low confidence, confidence exactly
-  at threshold, an established language carried in, a confident detection
-  overriding it, an empty chunk, and a return to an earlier language.
-- 5 service tests: resolved language stored per segment, established
-  language carried across a chunk boundary, inherited from an interrupted
-  run on resume, override passed to the model, and null passed when
-  detection is automatic.
-- 7 new ML tests: per-window detection, one detection per window shared
-  between segments, midpoint attribution for a straddling segment, clamping
-  for a segment overrunning the audio, the override path, and `configure`.
-- 4 new medium tests on `getLastLanguage`: no segments, latest by start time
-  rather than insertion order, a pre-detection segment, and isolation
-  between assets.
-- Full server unit suite green (2302 passed, 2 skipped). ML suite green (114
-  passed, 3 skipped). Server lint/format/typecheck, web svelte-check, and ML
-  ruff/mypy --strict all green.
+- 11 unit tests on the filter: each rule independently, each half of the
+  paired rule retained on its own, both halves failing, the repetition rule
+  alone, every threshold exactly, a mixed transcript, empty input, null
+  signals, half-recorded signals, and the same rows judged differently by
+  changed thresholds.
+- 4 asset-service tests on `getCaptions`: passing segments rendered, a
+  hallucinated one excluded, thresholds changed without re-running
+  inference, and progress still reported when everything is filtered out.
+- 2 transcription-service tests: signals stored per segment, and a segment
+  every threshold would reject still persisted.
+- 3 medium tests: signals round-trip through the database, a rejected
+  segment is stored, and a segment written without signals reads back null.
+- 1 new ML test that a segment scoring badly on all three is reported
+  rather than withheld; the existing transcription tests moved onto a
+  `whisper_segment` helper so a decoded segment carries the new fields.
+- Full server unit suite green (2319 passed, 2 skipped). ML suite green
+  (115 passed, 3 skipped). Server lint/format/typecheck, web svelte-check,
+  and ML ruff/mypy --strict all green.
 
-Also fixed: `mypy --strict` was already failing on whisper.py before this
-branch touched it (a stale `type: ignore[return-value]` on `_load`). It is
-one line in a file this issue rewrites, so it was replaced with a `cast`
-rather than left broken.
+Also fixed: `system-config.service.spec.ts` asserts the whole default
+config object, so the three new defaults had to be added there.
 
 Not done / caveats:
-- Detection granularity is one 30s encoder window, which is the finest the
-  model has an opinion at. A switch mid-window is attributed to whichever
-  language the window as a whole reads as, as measured above. Narrowing it
-  would mean overlapping windows and more encoder passes; worth revisiting
-  only if mid-window switching turns out to matter in practice.
+- Thresholds are global, not per-asset or per-language. The signals are
+  per-segment in the database, so narrowing that later is a config change
+  rather than a schema change.
+- The filter is applied to the caption track only. Search indexing of
+  transcripts does not exist yet; when it does it should use the same
+  function, which is why it takes any object carrying the three signals
+  rather than a segment row.
+- Defaults are inherited from Whisper rather than tuned against a corpus of
+  real hallucinations. Retuning is now cheap by construction, which is the
+  point of the slice, but somebody should still look at real output.
+- The workspace was in a broken state on arrival, unrelated to this issue:
+  `@immich/sdk` and `@immich/plugin-sdk` had no build output, which fails
+  every server test and every server build. Both were rebuilt (sdk first,
+  plugin-sdk depends on it). Worth knowing before blaming a branch.
 - The medium-test harness still cannot start its own database here:
   testcontainers fails against this host's Docker with "Log stream ended",
-  on a clean checkout as much as on this branch. The medium tests were run
-  against the running `ghcr.io/immich-app/postgres` with a local global
-  setup pointed at it; all 13 in the transcript suite pass.
+  as it did on the previous issue and on a clean checkout. The medium tests
+  were run against the running `ghcr.io/immich-app/postgres` with a
+  throwaway global setup pointed at it; all 16 in the transcript suite pass.
+  The throwaway setup was deleted and is not part of the commit.
 - The Dart SDK was not regenerated: `openapi-generator-cli` is unavailable
   here, and `mobile/openapi` already lacked `TranscriptionConfig`, so this
   branch does not make it any staler.
-- `minLanguageConfidence` is exposed but the silence thresholds and the
-  window size remain constants, as before.
