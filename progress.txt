@@ -1,75 +1,66 @@
-Issue #3: Tracer: end-to-end subtitles on a short video
+Issue #4: Performance gate: measure model throughput and confirm model choice
 
-Implemented the thinnest complete path for automatic video subtitle
-generation, end to end: upload a short video with speech -> a transcript
-job runs automatically -> captions render in the web player.
+Measured whether faster-whisper-small at int8 is fast enough on target
+hardware to keep automatic subtitles worth having, and applied the issue's
+decision rule. Gate CLOSED: the model selection stands, no escalation.
 
-Machine-learning service (machine-learning/):
-- Added `ModelTask.TRANSCRIPTION` and `ModelSource.WHISPER`.
-- Added `WhisperTranscriber` model adapter (models/transcription/whisper.py)
-  wrapping faster-whisper. Overrides the four base-class assumptions that
-  don't apply to it: `_download` (pulls from the `Systran/faster-whisper-*`
-  HF namespace instead of `immich-app/*`), `_load` (constructs a
-  `WhisperModel` instead of an onnx/armnn/rknn session, with an explicit
-  `cpu_threads` cap), `model_path`/`cached` (the model is a directory with
-  a `model.bin` marker file, not a single suffixed file), and forces
-  `ModelFormat.ONNX` so the base class's hardware-format autodetection is
-  a no-op for this model type.
-- VAD (`vad_filter=True`) and continuous language detection
-  (`multilingual=True`) are enabled unconditionally.
-- Added an `audio` payload type to the `/predict` endpoint alongside the
-  existing `image`/`text` types.
-- Added `faster-whisper` dependency; `uv.lock` regenerated.
-- Tests: machine-learning/test_main.py::TestTranscription (8 tests) cover
-  directory-based cached/model_path, the whisper HF download namespace,
-  the CPU thread cap being passed to WhisperModel (default and override),
-  and VAD/multilingual being enabled on predict.
+Benchmark harness (machine-learning/scripts/benchmark_transcription.py):
+- Drives the production `WhisperTranscriber` and the server's exact audio
+  extraction flags (`-vn -ac 1 -ar 16000 -f wav`, mirroring
+  `MediaRepository.extractAudio`), so it measures the path the job queue
+  takes rather than a hand-tuned best case.
+- Reports throughput as a ratio against real time, loaded-model RSS,
+  VAD-detected speech seconds, and a VAD-on/VAD-off comparison. Exits
+  non-zero below the 2x threshold so the gate is mechanical.
+- Documented under a new "Transcription Throughput" section in
+  machine-learning/README.md.
 
-Server (server/):
-- New `transcript_segment` table (assetId FK, cascade delete on asset
-  removal, startTime/endTime/text) via migration
-  1785274558937-AddTranscriptSegmentTable.ts. Added `asset_job_status
-  .transcribedAt` for job-completion tracking, mirroring `ocrAt`.
-- New `QueueName.Transcription` / `JobName.AssetTranscribe(QueueAll)`,
-  wired into JobRepository, QueueService (start/concurrency/legacy
-  status), and job.service.ts's post-thumbnail fan-out: transcription is
-  queued only in the existing `asset.type === AssetType.Video` branch,
-  alongside AssetEncodeVideo.
-- New `TranscriptionService` (services/transcription.service.ts):
-  extracts audio from the ORIGINAL file (never transcoded) as 16kHz mono
-  PCM WAV via a new `MediaRepository.extractAudio`, calls the ML
-  `/predict` endpoint via a new `MachineLearningRepository.transcribe`,
-  persists segments, and cleans up the temp file. Skips cleanly (does not
-  fail the job) when transcription is disabled by config or the video has
-  no audio stream, per acceptance criteria.
-- Config: `TranscriptionConfigSchema` (enabled, modelName, threads) under
-  `machineLearning.transcription`; default model `small`, thread cap 4.
-  The thread cap is always sent to the ML service, never left at "0 =
-  unbounded".
-- New `GET /assets/:id/captions.vtt` endpoint (asset.controller.ts)
-  rendering WebVTT on demand from stored segments; returns valid (possibly
-  empty) WebVTT for any video so the player's `<track>` never 404s.
-- Tests: transcription.service.spec.ts (9 tests) cover the disabled path,
-  the no-audio-track path, the hidden-asset path, and the success path.
-  Updated job.service.spec.ts / queue.service.spec.ts for the new queue.
+Hardware: Intel i7-8650U (2018 mobile, 4c/8t), 23 GiB RAM, CPU only, at the
+server's default 4 threads and queue concurrency 1. Load average 5.9-6.5
+during runs, so the numbers are a floor rather than a best case.
 
-Web (web/):
-- Added `<track kind="subtitles">` to both the HLS and plain `<video>`
-  branches in VideoNativeViewer.svelte, pointed at the new captions.vtt
-  endpoint via a new `getAssetCaptionsUrl` helper. Per the issue #2 spike
-  findings, browser auto-selection of `<track default>` isn't reliable on
-  the custom `hls-video` element, so `track.mode = 'showing'` is set
-  explicitly in the existing `handleCanPlay` hook.
-- Added the Transcription queue to the admin Jobs settings page.
+Results (production config, VAD on):
+- Amateur vlog, 940s, 88.6% speech ......  3.97x real time
+- Wedding montage, 689s, 0% speech ...... 127.58x real time
+- LibriVox chapter, 553s, 97.9% speech ..   3.51x real time
+Three independent repetitions; worst production observation anywhere 2.88x,
+still 44% above the 2x threshold.
 
-Regenerated the OpenAPI spec and TypeScript SDK (`@immich/sdk`) for the
-new endpoint/DTOs.
+Model memory footprint: 397 MiB RSS over a ~261 MiB interpreter baseline,
+reproducible to 0.1 MiB across three clips and five isolated repetitions.
+Peak process RSS during transcription scales with clip length: 940 MiB at
+689s, 1458 MiB at 940s.
 
-Verification: full test suites pass in all three projects (server: 2259
-passed, web: 518 passed, machine-learning: 106 passed), plus `tsc
---noEmit`, `svelte-check`, mypy, and eslint/ruff on all touched files.
+Effect of VAD: 65.5x faster on the music-only montage (VAD eliminates 100%
+of decode work), 1.28x on the talking-heavy vlog, 1.19x on continuous
+speech. Two findings worth keeping: with VAD off the montage drops to
+1.95x, the only sub-threshold figure measured anywhere, so VAD is
+load-bearing rather than an optimisation; and with VAD off the model
+hallucinates over non-speech, emitting 24 segments across a clip that
+contains none. `vad_filter=True` is a correctness measure as much as a
+performance one.
 
-Not done (explicitly out of scope for this tracer bullet, per the issue):
-audio is extracted from the whole file in one piece with no chunking; no
-transcript panel/search/inline editing UI (later PRD slices); no captions
-in the Chromecast remote viewer or the Memories video viewer.
+Why the gate is closed on a bound rather than an anecdote: decode cost
+tracks detected speech seconds, not media duration. The clips fit
+`wall ~ 0.0078 x duration + speech_seconds / 3.5` (the zero-speech montage
+isolates the VAD scan cost; the two speech-bearing clips agree to within 3%
+on decode rate). Since no video exceeds 100% speech, the floor is ~3.4x, and
+every personal video — having less speech to decode — sits above it.
+
+On test material: the issue asks for representative personal video, not a
+continuous-speech clip. That proved to be the hard part. Of four archive.org
+candidates, one had no audio stream, one had an AAC track carrying no
+signal, and the 11.5-minute amateur wedding video — genuine audio, RMS 0.081
+— contains zero VAD-detected speech end to end. It is kept in the set
+because it is real and representative, not despite it. The continuous-speech
+clip is included precisely because it measures the conservative direction.
+
+Recorded in machine-learning/docs/transcription-performance-gate.md, with
+raw per-clip measurements in machine-learning/docs/transcription-gate-results/.
+
+Not done: single host, CPU only. A NAS-class Celeron or low-end ARM board
+could plausibly fall below 2x and is not covered; anyone targeting such
+hardware should re-run the harness. Only English-language material was
+measured. No chunking of long audio was added — peak RSS of ~1.5 GiB on a
+15-minute video is the strongest argument for the chunking the tracer bullet
+deferred, but that is a separate slice.
