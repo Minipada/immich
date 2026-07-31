@@ -142,6 +142,7 @@ describe(ServerService.name, () => {
         oauth: false,
         oauthAutoLaunch: false,
         ocr: true,
+        transcription: true,
         passwordLogin: true,
         search: true,
         sidecar: true,
