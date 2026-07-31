@@ -1,111 +1,118 @@
-Issue #7: Quality signals and read-time hallucination filtering
+Issue #8: Bulk transcription queue, job panel and completion semantics
 
-Every segment now carries three signals from the model, every segment is
-stored whatever they say, and the caption track excludes the failures when
-it is read. All eight acceptance criteria are covered.
+An administrator can transcribe an existing library from the job panel,
+watch it progress, and re-run a single video without touching the rest.
+All nine acceptance criteria are covered.
 
-ML side (immich_ml/models/transcription/whisper.py, schemas.py):
-- `no_speech_prob`, `avg_logprob` and `compression_ratio` are already on
-  every faster-whisper segment; they are passed through as decoded, under
-  the same names the rest of the transcript uses.
-- Passed through, not acted on. faster-whisper applies thresholds of its
-  own while decoding, but only to pick a temperature to retry at — it
-  emits the segment either way. The adapter stays a reporter for the same
-  reason it does with language confidence: the decision is the server's.
+Already in place before this issue (from the tracer bullet, #3):
+- `AssetTranscribeQueueAll` streaming asset ids and enqueueing per-asset
+  `AssetTranscribe` jobs in pages of JOBS_ASSET_PAGINATION_SIZE.
+- `QueueName.Transcription` registered at concurrency one, wired into
+  `QueueService.start` for both targeting modes, and present in the
+  administrator concurrency settings.
+- `streamForTranscriptionJob` already excluded hidden assets, non-videos
+  and deleted assets, and already switched on `force` between "only
+  unprocessed" and "all". It now has tests that say so.
 
-The filter (server/src/utils/transcription.ts, `filterHallucinations`):
-- Discard when no-speech probability is above its threshold AND average
-  log-probability is below its own. Either alone has an innocent reading —
-  a high no-speech probability also describes quiet but genuine speech, a
-  low log-probability also describes speech the model found hard (an
-  accent, a crowd, a bad microphone) — so pairing them is what stops the
-  rule firing on real speech. Together they say the model neither heard
-  speech nor believed what it wrote down.
-- Discard when compression ratio is above its threshold, on that signal
-  alone. Compression ratio is text length over compressed size, so nothing
-  but a repetition loop reaches a high value; there is no innocent reading
-  to pair it against.
-- At a threshold exactly the segment is kept. The settings read as the
-  worst still tolerated, so discarding at the boundary would be off by one.
-  Same reasoning as `minLanguageConfidence` in issue #6, opposite direction.
-- No phrase blocklist, as the issue specifies. It would be per-language,
-  unbounded, and a maintenance treadmill; the numbers identify the same
-  segments for a reason that holds in every language.
-- A segment whose signals are null is kept. Null means "written before this
-  change", not "scored zero" — judging on a missing number would silently
-  blank every transcript made before this branch. The paired rule needs
-  both signals present, so a half-recorded segment is kept too.
+Completion semantics (transcription.service.ts):
+- A video with no audio track is marked transcribed rather than merely
+  skipped. Whether a file has audio is only known once it has been
+  probed, so a silent video left unprocessed is re-probed by every bulk
+  run from now on — a tax that grows with the library. Recording the
+  answer costs one row; a changed file is covered by forced re-processing.
+- A hidden asset is still skipped without being marked, so unhiding it
+  later puts it back in the queue. That case is not permanent the way an
+  absent audio track is.
+- Note on the issue's premise: it says there is no persisted audio-stream
+  information at query time. Upstream has since added an `asset_audio`
+  table, so there partly is. It is still not usable as a queue filter —
+  an absent row means either "no audio" or "metadata extracted before
+  those tables existed" — so mark-complete remains the right answer, and
+  it is what the acceptance criteria ask for.
 
-Read time, not ingest (asset.service.ts, transcription.service.ts):
-- `transcribeChunk` writes every segment the model returned, signals
-  included, and never inspects them.
-- `getCaptions` reads the config alongside the segments and filters there.
-  Changing a threshold changes what the next request renders; nothing is
-  re-transcribed. That is the one-way-door argument from the issue: rows
-  can be re-derived into a caption track, but inference discarded has to be
-  re-run across the whole library to get back.
-- Search is not touched. The issue names it as a later slice.
+Single-asset re-run:
+- `AssetJobName.REFRESH_TRANSCRIPT` on `POST /assets/jobs`, mapping to
+  `AssetTranscribe` with `force: true`.
+- Forced, because a finished asset's recorded offset sits at the end of
+  the file: unforced, the re-run would resume, find nothing to do, and
+  succeed having done nothing. `handleTranscribe` reads the offset only
+  when not forced, which routes a forced run through `reset` and clears
+  the earlier rows.
+- Web: "Refresh transcript" in the asset viewer menu and "Refresh
+  transcripts" in the five bulk-selection menus, both gated on the asset
+  being a video and on the new transcription feature flag.
 
-Schema and config:
-- `transcript_segment.noSpeechProbability`, `avgLogProbability`,
-  `compressionRatio`, all nullable `real` (migration 1785447598281).
-  Nullable only for segments written before this change. Written by hand
-  because the build was broken here (see caveats), then verified: the
-  migration applies cleanly and `migrations:generate` afterwards reports
-  "No changes detected", so it matches the table definition exactly.
-- `machineLearning.transcription.maxNoSpeechProbability` (0.6),
-  `minAvgLogProbability` (-1), `maxCompressionRatio` (2.4). These are
-  Whisper's own decoding defaults, which is the only calibration anyone has
-  for these three numbers; nothing here argues for departing from them
-  before there is evidence.
-- OpenAPI spec, TypeScript SDK client and SQL query snapshots regenerated.
-- No administrator UI: issue #13 covers transcription settings, same as the
-  chunking and language settings before it.
+Retries and timeout:
+- `TRANSCRIPTION_JOB_ATTEMPTS = 2`, pinned in `getJobOptions` rather than
+  inherited from the global default. One retry catches the transient
+  failures — the machine-learning service restarting, a worker killed
+  mid-file — and costs little, because a retry resumes from the last
+  committed chunk. The rest are deterministic (corrupt stream,
+  undecodable codec, model out of memory) and re-hit the same wall at
+  whole-video cost on a queue that runs one job at a time.
+- `getJobTimeout(duration, multiplier)`: a whole-asset budget, checked
+  between chunks. The per-chunk inference timeout bounds one model call
+  and says nothing about the job; a long video is hundreds of calls, and
+  a pathological file whose every chunk returns just under its ceiling
+  would otherwise hold the queue for a day. Exceeding it returns Failed
+  with the offset intact, so a later run resumes rather than restarting.
+  The floor is the inference floor, and the check is only between chunks,
+  so the first chunk of a run always goes ahead: no job is killed having
+  transcribed nothing.
+
+Job panel:
+- `QueueName.Transcription` added to `asQueueItem` (icon, title,
+  description) and to `QueuePanel`'s `queueDetails` with "all" and
+  "missing" buttons, disabled when the feature is off.
+- "All" now asks for confirmation, as face detection does: it truncates
+  every transcript in the library and takes hours. The confirmation
+  switch was rewritten as a lookup, because the old one relied on a
+  fallthrough that a second case would have silently changed.
+- New `transcription` server feature flag (`isTranscriptionEnabled`),
+  which is what gates both the panel entry and the per-asset actions.
 
 Tests:
-- 11 unit tests on the filter: each rule independently, each half of the
-  paired rule retained on its own, both halves failing, the repetition rule
-  alone, every threshold exactly, a mixed transcript, empty input, null
-  signals, half-recorded signals, and the same rows judged differently by
-  changed thresholds.
-- 4 asset-service tests on `getCaptions`: passing segments rendered, a
-  hallucinated one excluded, thresholds changed without re-running
-  inference, and progress still reported when everything is filtered out.
-- 2 transcription-service tests: signals stored per segment, and a segment
-  every threshold would reject still persisted.
-- 3 medium tests: signals round-trip through the database, a rejected
-  segment is stored, and a segment written without signals reads back null.
-- 1 new ML test that a segment scoring badly on all three is reported
-  rather than withheld; the existing transcription tests moved onto a
-  `whisper_segment` helper so a decoded segment carries the new fields.
-- Full server unit suite green (2319 passed, 2 skipped). ML suite green
-  (115 passed, 3 skipped). Server lint/format/typecheck, web svelte-check,
-  and ML ruff/mypy --strict all green.
+- 6 transcription-service tests: no-audio marks transcribed, hidden stays
+  unmarked, forced re-run ignores a completed offset and re-transcribes,
+  the budget stops a run mid-file without marking it done, the first
+  chunk always runs however short the budget, and a forced bulk run both
+  truncates and enqueues.
+- 2 asset-service tests: the refresh job is forced, and it touches only
+  the asset it names.
+- 5 medium tests on `streamForTranscriptionJob`: unprocessed queued,
+  transcribed skipped, transcribed queued when forced, hidden excluded in
+  both modes, non-video excluded in both modes.
+- Server unit suite green (2326 passed, 2 skipped). Web unit suite green
+  (518 passed, 2 skipped). Server lint/format/typecheck, web
+  lint/format/svelte-check/tsc all green.
+- Medium suite: 403 passed, 24 failed in four files — ffprobe/exiftool
+  and the workflow plugin binaries are missing from this environment. All
+  four fail the same way on a clean checkout; none touch transcription.
 
-Also fixed: `system-config.service.spec.ts` asserts the whole default
-config object, so the three new defaults had to be added there.
+Also fixed: `MediumTestContext.newJobStatus` built its insert from
+`{ assetId }` alone and dropped every other field it was given, so
+callers that passed a timestamp silently got the factory default. It now
+forwards the whole dto. Existing callers were relying on the default
+anyway, so nothing changed for them.
 
 Not done / caveats:
-- Thresholds are global, not per-asset or per-language. The signals are
-  per-segment in the database, so narrowing that later is a config change
-  rather than a schema change.
-- The filter is applied to the caption track only. Search indexing of
-  transcripts does not exist yet; when it does it should use the same
-  function, which is why it takes any object carrying the three signals
-  rather than a segment row.
-- Defaults are inherited from Whisper rather than tuned against a corpus of
-  real hallucinations. Retuning is now cheap by construction, which is the
-  point of the slice, but somebody should still look at real output.
-- The workspace was in a broken state on arrival, unrelated to this issue:
-  `@immich/sdk` and `@immich/plugin-sdk` had no build output, which fails
-  every server test and every server build. Both were rebuilt (sdk first,
-  plugin-sdk depends on it). Worth knowing before blaming a branch.
+- The Dart SDK was not regenerated, consistent with the rest of this
+  branch: `mobile/openapi` already lacks the transcription models from
+  issues #3–#7, so regenerating here would land five issues' worth of
+  unrelated diff on this one. `mobile/lib/utils/openapi_patching.dart`
+  was left alone for the same reason — patching in a default for a field
+  the generated model does not have would be meaningless.
+- The bulk "all" mode truncates every transcript before enqueueing, which
+  is the reset semantic face detection uses. There is no "re-transcribe
+  only these albums" or "only this date range"; the issue does not ask
+  for one and the per-asset re-run covers the narrow case.
+- The job budget is enforced between chunks, so a single chunk that hangs
+  is bounded only by the inference timeout, not by the budget. That is
+  deliberate — killing a model call mid-flight loses the chunk — but it
+  means the effective ceiling is the budget plus one chunk timeout.
 - The medium-test harness still cannot start its own database here:
-  testcontainers fails against this host's Docker with "Log stream ended",
-  as it did on the previous issue and on a clean checkout. The medium tests
-  were run against the running `ghcr.io/immich-app/postgres` with a
-  throwaway global setup pointed at it; all 16 in the transcript suite pass.
-  The throwaway setup was deleted and is not part of the commit.
-- The Dart SDK was not regenerated: `openapi-generator-cli` is unavailable
-  here, and `mobile/openapi` already lacked `TranscriptionConfig`, so this
-  branch does not make it any staler.
+  testcontainers fails against this host's Docker with "Log stream
+  ended", as on the previous three issues. The medium tests were run
+  against a manually started `ghcr.io/immich-app/postgres` with a
+  throwaway global setup pointed at it. The setup and its config were
+  deleted and are not part of the commit.
