@@ -119,6 +119,19 @@ Verified against a running instance:
   appeared within the poll interval with the percentage advancing, all
   without a reload. At 420px wide the panel becomes the bottom drawer and
   the video keeps the space above it.
+- Captions on the video were sitting behind the play button and the
+  progress bar, and clipping at the bottom edge — worst with the panel
+  open on a narrow viewport, where the video area is short and the
+  controls take a larger share of it. A player puts its captions at the
+  bottom of the video box, which is where the control bar is. The cue
+  container is now lifted by the height of the controls, which leaves the
+  browser to wrap, align and style the cues, including a reader's own
+  caption preferences. Positioning each cue instead was tried first and
+  rejected: anchoring a cue's bottom edge needs `snapToLines = false`,
+  and Blink then lays the cue out on one line and clips the overflow
+  rather than wrapping it — verified in the browser, not assumed. Blink
+  and WebKit expose the container; Firefox has no equivalent, so captions
+  there stay where it puts them, which is what they do today.
 - One bug was found this way and fixed in a follow-up commit: filtering
   shortened the list, the browser clamped the scroll position to the
   shorter content, and the resulting scroll event was attributed to the
