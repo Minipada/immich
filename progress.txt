@@ -434,3 +434,97 @@ Not done / caveats:
   implemented, since the single-asset path was never blocked to begin
   with — it already requires its own explicit confirmation, which is the
   gap this issue closes.
+
+Issue #12: Subtitles for shared-link recipients
+
+A shared-link recipient with no account now sees the same subtitles the
+owner does. All six acceptance criteria are covered, and every one of them
+turned out to already be true — issue #9 put `sharedLink: true` on both
+`GET .../captions.vtt` and `GET .../transcript` from the start ("at the
+same permission as the caption track"), and issue #11 added the correction
+endpoint without that flag, which the generic auth guard already turns into
+a rejection for a shared-link caller. There was nothing to build; the gap
+this issue closes is that none of it was under test.
+
+What was already true, and why:
+- `AuthService.authenticate` rejects `authDto.sharedLink && !sharedLinkRoute`
+  outright, before the controller ever runs — the correction endpoint's
+  missing `sharedLink: true` is what "correction attempts from a
+  shared-link caller are rejected" means, not something added now.
+- The query-string auth the issue asks for ("authorization must travel in
+  the query string, because the browser's media loader sets no header") is
+  not a new mechanism: `AuthGuard`/`AuthService.validate` already read
+  `?key=`/`?slug=` generically for every route, shared-link or not — it is
+  exactly how the existing `GET /assets/:id` shared-link test already
+  worked. `checkSharedLinkAccess` (`utils/access.ts`) already grants
+  `Permission.AssetView` — the permission both GET routes require — to a
+  shared-link caller scoped to the link's assets, and falls through to an
+  empty set for `Permission.AssetUpdate`, which is what actually blocks the
+  correction endpoint even before the routing-level rejection above.
+  Expired-or-invalid is likewise generic: `isValidSharedLink` treats a
+  missing key and a past `expiresAt` identically, both raising "Invalid
+  share key" — there is one path, not two.
+- On the web side, `authManager.params` already spreads `{ key, slug }`
+  from the share-page route into every request made from the viewer,
+  including `getAssetCaptionsUrl` (used by `<track src>`) and
+  `getAssetTranscript`/`updateTranscriptSegment` (used by the panel). The
+  "Transcript" viewer action is gated only on the asset being a video and
+  the feature flag, not on ownership or an authenticated session, so it
+  already renders on the public share page. `authenticate(url, { public:
+  isSharedLinkRoute(route.id) })` in the share route's layout is what
+  makes the page reachable with no session in the first place — sharing
+  images already worked this way, and video inherited it for free.
+
+What was added:
+- 6 e2e tests, in a new `describe('transcript access via shared link')`
+  block in `asset.e2e-spec.ts`, reusing the seeded-video-plus-segment
+  pattern the transcript-correction tests already use: captions and the
+  transcript both retrievable with a valid `?key=`; both rejected with an
+  invalid key; both rejected with an expired one (one test, since the
+  rejection path is the same for both endpoints); and a correction attempt
+  with a valid shared-link key rejected with 403.
+- No server or web source change. Grepping for it before writing tests
+  would have found nothing to fix — confirmed by reading `sharedLink: true`
+  already on both GET routes and already absent from the PUT route, and by
+  driving the browser against a live instance before writing a single test,
+  rather than assuming the issue implied a gap that had to be closed in
+  application code.
+
+Verified against a running instance:
+- Reused the postgres and valkey containers already running from prior
+  sessions on this host (published ports, since rootless Docker makes
+  container IPs unreachable directly), which still held the 24-segment
+  seeded video transcript from issue #9's verification. The built server
+  ran natively (`IMMICH_WORKERS_INCLUDE=api`), same as issue #11, for the
+  same pre-existing reverse-geocoding gap in the full microservices
+  worker. The admin password was reset via `immich-admin
+  reset-admin-password`'s underlying service call (the interactive prompt
+  itself does not survive being piped) rather than guessed.
+- Curled both endpoints directly: `captions.vtt?key=<link>` and
+  `transcript?key=<link>` each returned 200 with no auth header at all; the
+  same two URLs with a mangled key, and with an explicitly expired link,
+  each returned 401 `Invalid share key`; the correction `PUT
+  .../transcript/segments/:id?key=<link>` returned 403 `Forbidden`.
+  `machineLearning.enabled` was flipped on system config only long enough
+  to satisfy the web feature flag (no inference invoked — every segment
+  here was seeded directly) and set back afterward, same as issue #11.
+- Drove the browser to the public share page for the shared video, with no
+  cookies, session or authorization header of any kind: the "Transcript"
+  action was present in the viewer nav bar, and clicking it opened the
+  panel with all 24 seeded lines, fetched over the same `?key=` URLs
+  curled above. The video element's own `<track>` request for
+  `captions.vtt?key=...` is visible in the network log returning 200, same
+  as the panel's `transcript?key=...`; two unrelated requests (a
+  transcoded-playback variant and a thumbnail) 404 on this asset because
+  it was seeded with transcript rows directly and never ran the encoding
+  job, the same pre-existing limitation issue #9 and #11 already noted for
+  this seeded asset. Both shared links created for this were deleted from
+  the live instance afterward.
+
+Not done / caveats:
+- The Dart SDK was not regenerated, consistent with every prior issue on
+  this branch — there is no API surface change here to regenerate against
+  anyway.
+- Nothing was found to fix in `checkSharedLinkAccess`, the auth guard, or
+  the web client; the verification above exists to demonstrate that, not
+  to describe a change to any of them.
