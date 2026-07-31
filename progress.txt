@@ -273,3 +273,164 @@ Not done / caveats:
 - `correctedText` is write-less until issue #11 adds the editing UI and its
   endpoint; until then every segment's `correctedText` is null and the
   search text builder falls back to the model's own text for all of them.
+
+Issue #11: Transcript correction with re-processing lock
+
+Correcting a misheard line now changes what the caption track and search
+show immediately, survives re-processing, and can be reverted. All ten
+acceptance criteria are covered.
+
+Storage and write path:
+- No new migration: `transcript_segment.correctedText` already existed,
+  added ahead of need by issue #10. `TranscriptRepository.updateSegment(id,
+  assetId, correctedText)` is the first write to it — an `UPDATE ...
+  WHERE id = ? AND assetId = ?`, scoped to the asset as well as the segment
+  so a caller that has already checked access to one asset cannot reach
+  another's row with a guessed segment id. `correctedText: null` reverts to
+  the model's own text; it is the same endpoint rather than a second one,
+  since "revert" is just a correction of `null`.
+- `AssetService.updateTranscriptSegment` gates on `Permission.AssetUpdate`
+  (not `AssetView`, unlike every other transcript read) and rebuilds the
+  flattened search text immediately afterward, using the same
+  `buildTranscriptSearchText` the transcription job itself calls at
+  completion. A correction search cannot find is pointless, and derived
+  text does not update itself.
+- The caption track had the gap issue #10 flagged: `buildTranscriptSearchText`
+  already preferred `correctedText ?? text`, but `toWebVtt` still burned in
+  the model's own text. Both now agree.
+- `TranscriptSegmentResponseDto` gained `correctedText`; `text` stays as the
+  model's own output, unaffected by any correction, so "the original model
+  output remains viewable" is a property of the read rather than a second
+  request.
+
+The re-processing lock:
+- Time-anchored reconciliation — reattaching a correction to whatever a
+  re-run produces by matching time ranges — was rejected. Re-transcription
+  does not produce stable boundaries: different seams, voice-detection
+  variance and model nondeterminism all shift them, so a correction
+  reattached this way can silently land on text it does not match. That is
+  corruption presenting as human-verified, worse than data loss the user
+  was warned about.
+- Consequently `TranscriptRepository.reset` — called at the start of every
+  forced (re-)transcription run, single-asset or library-wide — now deletes
+  only segments where `correctedText is null`. A correction is left exactly
+  as written rather than risked. This is "forced re-processing preserves
+  corrected segments," tested directly against a real database.
+- The library-wide `deleteAll` (queue-all with `force`) goes further: an
+  asset with any corrected segment is excluded from the sweep entirely —
+  corrected and uncorrected segments alike are left untouched, and its
+  `asset_job_status`/search rows are left alone too — rather than being
+  partially cleared. `AssetJobRepository.streamForTranscriptionJob` carries
+  the same exclusion, so a corrected asset is never even queued for a bulk
+  run, forced or not. This is what "assets with any corrected segment are
+  excluded from bulk runs" means: not touched, not partially discarded.
+- Single-asset re-processing (the "Refresh transcript" job action, always
+  forced) is deliberately not excluded — the owner can still explicitly
+  redo one video — but now requires confirmation first, added at the one
+  place both the single-asset and bulk-selection actions funnel through
+  (`handleRunAssetJob`). The dialog's copy is honest about what actually
+  happens: corrections are kept, everything else is regenerated. This
+  differs from the existing library-wide "force reprocess all" confirmation
+  in the admin queue panel, which still (correctly) warns that it discards
+  everything, since that path's `deleteAll` never touches a corrected asset
+  in the first place.
+
+Web — inline correction:
+- Each transcript line grew a pencil icon (edit) beside it, and a history
+  icon (revert) that appears only once a line is corrected. Editing swaps
+  the line for a `Textarea` sized to one row; saving happens on blur if the
+  trimmed text differs from what is currently displayed, mirroring
+  `DetailPanelDescription`'s bind-and-save-on-blur pattern for the asset
+  description. Escape blurs without saving, tracked by a plain boolean
+  rather than component state, since it only ever needs to survive from one
+  keystroke to the very next blur event.
+- Emptying the line, or typing back exactly what the model originally said,
+  both save as a revert (`correctedText: null`) rather than as a blank or
+  redundant correction — the same outcome as pressing the revert icon, from
+  the box instead.
+- A correction renders with a small "Corrected" badge and the original
+  text beneath it in muted italics, so "corrected lines are visibly
+  distinguishable" and "the original model output remains viewable" are
+  both true without a click or a toggle.
+- The click-to-seek behaviour could not stay a single `<button>` once an
+  editable line needed a sibling row of icon buttons: a `<textarea>` cannot
+  live inside a `<button>` per the HTML content model. The line is now a
+  `<div>` row holding either the seek button or the edit textarea, with the
+  edit/revert icons as further siblings — never nested inside each other.
+- The panel's own client-side filter matches against `correctedText ??
+  text`, the same preference order as everywhere else; searching for what a
+  line was corrected to is the entire point of correcting it.
+- Edit and revert controls are gated on `isOwner` (`authManager.authenticated
+  && authManager.user.id === asset.ownerId`), the same simplified ownership
+  check `DetailPanelDescription` already uses for the same purpose.
+
+Tests:
+- 9 new/updated server unit tests: `getTranscript`/`getCaptions` include
+  `correctedText`; `updateTranscriptSegment` writes the correction, rebuilds
+  search text, reverts on `null`, rejects a segment id that does not belong
+  to the given asset, and requires `AssetUpdate` rather than `AssetView`.
+  2 new `toWebVtt` tests confirm the correction preference.
+- 8 new medium (real-database) tests: `updateSegment` writes, reverts and
+  is scoped to the given asset; `reset` preserves a corrected segment while
+  clearing an uncorrected one; `deleteAll` leaves an asset with any
+  correction completely untouched while still sweeping a plain one;
+  `streamForTranscriptionJob` excludes a corrected asset even when forced.
+- 6 new web unit tests: a correction is visibly distinguishable with the
+  original still shown; edit/revert controls are absent without
+  asset-update access; inline correction saves and re-renders; Escape
+  discards without saving; revert restores the model text; the panel's
+  filter matches by corrected text. 3 new tests on `handleRunAssetJob`:
+  confirms and skips on cancel, confirms and proceeds on accept, and does
+  not confirm an unrelated job.
+- 6 e2e tests added to `asset.e2e-spec.ts` for the new endpoint: requires
+  access, rejects a blank correction, rejects a segment belonging to a
+  different asset, corrects a segment (and confirms both the transcript
+  read and the caption track reflect it), and reverts a correction. As with
+  issue #10, not run through the full e2e harness — that stack builds the
+  server image from scratch, a heavier cost than this issue's server-side
+  SQL and unit coverage justified — but typechecked cleanly.
+- Server unit suite green (2352 passed, 2 skipped); server medium suite
+  green for the touched repositories (37 passed). Web unit suite green (539
+  passed, 2 skipped). Server and web lint/format/tsc green; svelte-check
+  reports 0 errors.
+
+Verified against a running instance:
+- Reused the postgres and valkey containers issue #9's verification left
+  running (published ports, since this host's rootless Docker makes
+  container IPs unreachable directly) rather than standing up a fresh pair;
+  its database already held issue #9's 24-segment seeded transcript on a
+  real video asset. Migrations were a no-op — already current.
+- The built server was run natively against it with only the `api` worker
+  included (`IMMICH_WORKERS_INCLUDE=api`): the full microservices worker
+  fails to bootstrap in this environment over an unrelated, pre-existing
+  gap — reverse geocoding requires geodata files this checkout does not
+  have, and that failure is fatal to the whole worker, not just to
+  geocoding. Everything this issue touches is reachable through the API
+  worker alone. `machineLearning.enabled` was flipped on system config only
+  long enough to satisfy the web feature flag gating the panel and job
+  action (no inference was ever invoked, since every segment here was
+  seeded directly), and set back to its prior value afterward.
+- Driven by browser: opened the transcript panel on the seeded video,
+  corrected the first line's misheard name, and confirmed in the same
+  session that the caption track (`GET .../captions.vtt`) rendered the
+  correction instead of the original text, and that `POST
+  /search/metadata` with the corrected phrase found the asset — both
+  without a reload. The corrected line showed the "Corrected" badge with
+  the original text beneath it. Reverting it removed both and the caption
+  track reverted with it. Opening "Refresh transcript" from the asset's
+  menu raised the confirmation dialog with the copy described above;
+  cancelling it left all 24 segments and zero corrections in the database,
+  confirming nothing was queued.
+
+Not done / caveats:
+- The Dart SDK was not regenerated, consistent with every prior issue on
+  this branch.
+- Timing edits, merging and splitting are explicitly out of scope per the
+  issue — corrections are text-only.
+- The recorded tradeoff the issue calls out stands as designed: a
+  collaborator's single-word correction excludes the asset from the
+  owner's bulk runs too. The suggested mitigation (an advisory lock that
+  blocks bulk but not the owner's explicit single-asset re-run) is not
+  implemented, since the single-asset path was never blocked to begin
+  with — it already requires its own explicit confirmation, which is the
+  gap this issue closes.
