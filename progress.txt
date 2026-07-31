@@ -16,19 +16,42 @@ Already in place before this issue (from the tracer bullet, #3):
 
 Completion semantics (transcription.service.ts):
 - A video with no audio track is marked transcribed rather than merely
-  skipped. Whether a file has audio is only known once it has been
-  probed, so a silent video left unprocessed is re-probed by every bulk
-  run from now on — a tax that grows with the library. Recording the
-  answer costs one row; a changed file is covered by forced re-processing.
+  skipped, so bulk runs stop re-examining it. Left unmarked it is
+  re-enqueued and re-dequeued by every run for the rest of the library's
+  life, and a queue that runs one job at a time should not spend every
+  run on tens of thousands of no-ops. A changed file is covered by forced
+  re-processing.
+- Note on the issue's premise: it says there is no persisted audio-stream
+  information at query time, so every bulk run re-probes every silent
+  video. That is no longer accurate. Upstream has since added an
+  `asset_audio` table and `getForTranscription` reads it, so a silent
+  video costs a queue round trip and one indexed read, not an ffprobe.
+  The conclusion survives the correction — mark-complete is still right,
+  and it is what the acceptance criteria ask for — but the cost being
+  avoided is queue churn rather than repeated probing.
+- An absent audio row has two readings, and only one of them is
+  permanent. Either the file was probed and has no audio track, or it has
+  never been probed by a version that records one: migration
+  1777654048096 created the stream tables empty, nothing backfills them,
+  and no later migration nulls `metadataExtractedAt` to force
+  re-extraction, so a library that upgraded past that point has videos
+  with audio and no row saying so.
+- A video stream row separates the two, because any video the current
+  extractor has seen has one. `getForTranscription` now selects
+  `asset_video.assetId` as `videoStreamId`; with it, "no audio" is a
+  permanent fact and is recorded, and without it the asset is left alone
+  to be picked up once its metadata has been extracted. Writing it off on
+  the absent audio row alone would silently exclude videos with perfectly
+  good audio until someone ran a forced re-transcription of the library.
+- Gating on `metadataExtractedAt` instead does not work: an asset
+  extracted before that migration has the timestamp set and no stream
+  row, so the two cases stay indistinguishable. Falling back to running
+  the extraction does not work either — `extractAudio` rejects on ffmpeg
+  error, so a genuinely silent video would fail its job rather than
+  report "no audio".
 - A hidden asset is still skipped without being marked, so unhiding it
   later puts it back in the queue. That case is not permanent the way an
   absent audio track is.
-- Note on the issue's premise: it says there is no persisted audio-stream
-  information at query time. Upstream has since added an `asset_audio`
-  table, so there partly is. It is still not usable as a queue filter —
-  an absent row means either "no audio" or "metadata extracted before
-  those tables existed" — so mark-complete remains the right answer, and
-  it is what the acceptance criteria ask for.
 
 Single-asset re-run:
 - `AssetJobName.REFRESH_TRANSCRIPT` on `POST /assets/jobs`, mapping to
@@ -72,22 +95,29 @@ Job panel:
   which is what gates both the panel entry and the per-asset actions.
 
 Tests:
-- 6 transcription-service tests: no-audio marks transcribed, hidden stays
-  unmarked, forced re-run ignores a completed offset and re-transcribes,
-  the budget stops a run mid-file without marking it done, the first
-  chunk always runs however short the budget, and a forced bulk run both
-  truncates and enqueues.
+- 8 transcription-service tests: a probed no-audio video is marked
+  transcribed, an unextracted one is neither marked nor transcribed and
+  is picked up once its stream rows exist, hidden stays unmarked, forced
+  re-run ignores a completed offset and re-transcribes, the budget stops
+  a run mid-file without marking it done, the first chunk always runs
+  however short the budget, and a forced bulk run both truncates and
+  enqueues.
 - 2 asset-service tests: the refresh job is forced, and it touches only
   the asset it names.
 - 5 medium tests on `streamForTranscriptionJob`: unprocessed queued,
   transcribed skipped, transcribed queued when forced, hidden excluded in
   both modes, non-video excluded in both modes.
-- Server unit suite green (2326 passed, 2 skipped). Web unit suite green
+- 3 medium tests on `getForTranscription`: an extracted video with no
+  audio reads as probed and silent, one that was never extracted reads as
+  unprobed, and an extracted video with audio reports its stream.
+- Server unit suite green (2328 passed, 2 skipped). Web unit suite green
   (518 passed, 2 skipped). Server lint/format/typecheck, web
   lint/format/svelte-check/tsc all green.
-- Medium suite: 403 passed, 24 failed in four files — ffprobe/exiftool
+- Medium suite: 406 passed, 24 failed in four files — ffprobe/exiftool
   and the workflow plugin binaries are missing from this environment. All
   four fail the same way on a clean checkout; none touch transcription.
+- SQL query snapshots regenerated; the only diff is the video stream join
+  and its selected column on `getForTranscription`.
 
 Also fixed: `MediumTestContext.newJobStatus` built its insert from
 `{ assetId }` alone and dropped every other field it was given, so
