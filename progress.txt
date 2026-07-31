@@ -82,28 +82,55 @@ Narrow viewports:
   is only possible for a video.
 
 Tests:
-- 11 web tests on the panel: lines and timestamps render, the filter
+- 12 web tests on the panel: lines and timestamps render, the filter
   narrows and reports matching nothing, a click seeks the player, the
   highlight moves as the playhead advances, scrolling stops following and
-  the button restores it, an in-progress transcript shows partial lines
-  with its indicator, the three empty states are distinguished, a failed
-  load is reported, and polling continues while in progress and stops on
-  completion.
+  the button restores it, filtering does not, an in-progress transcript
+  shows partial lines with its indicator, the three empty states are
+  distinguished, a failed load is reported, and polling continues while
+  in progress and stops on completion.
 - 5 server tests on `getTranscript`: timings returned, the caption
   track's thresholds applied, a partial transcript returned as in
   progress, a never-transcribed asset reported as not started, and view
   access required before anything is read.
-- Web unit suite green (529 passed, 2 skipped). Server unit suite green
+- Web unit suite green (530 passed, 2 skipped). Server unit suite green
   (2333 passed, 2 skipped). Server lint/format/tsc and web
   lint/format/svelte-check all green; svelte-check reports the same 7
   pre-existing errors as a clean checkout, all in unrelated test files.
 
+Verified against a running instance:
+- A stack was brought up for this: postgres and valkey in containers with
+  published ports (this host runs rootless Docker, so container IPs are
+  not routable), the built server run natively, and the web dev server
+  against it. A three-minute video was uploaded through the API and given
+  a transcript; the machine-learning container on this host is built from
+  the issue #3 image and rejects the current request shape, so the
+  segments were seeded directly rather than inferred. That exercises what
+  this issue added — the endpoint reads those rows and the panel reads
+  the endpoint — but not the model.
+- Confirmed by driving the browser: the panel opens beside the video
+  without covering it and the video shrinks into the remaining columns;
+  22 of 24 seeded rows are shown, the two carrying hallucination signals
+  filtered out by the shared read; clicking 02:22 moved the video to
+  142.4s and the highlight with it; the filter narrows to matching lines;
+  scrolling stops following and the button restores it; the three job
+  states each render as intended, including "Transcribing… 36%" over the
+  lines produced so far; and a chunk inserted while the panel was open
+  appeared within the poll interval with the percentage advancing, all
+  without a reload. At 420px wide the panel becomes the bottom drawer and
+  the video keeps the space above it.
+- One bug was found this way and fixed in a follow-up commit: filtering
+  shortened the list, the browser clamped the scroll position to the
+  shorter content, and the resulting scroll event was attributed to the
+  reader, so following switched itself off after a keystroke in the
+  filter box. The expected scroll position is now re-synced whenever the
+  visible lines change. The regression test reproduces it by firing the
+  scroll event the browser sends after the list shrinks, and fails
+  without the fix.
+
 Not done / caveats:
-- Not exercised against a running instance. There is no Immich stack in
-  this environment (the same reason the medium tests could not start
-  their own database on the previous issues), so the panel is verified by
-  unit tests and type/lint checks, not by eye. Worth a look on a real
-  library before merging — particularly the drawer at narrow widths.
+- Real inference was not exercised end to end here, for the reason above;
+  that path is issue #3's and was demonstrated there.
 - The Dart SDK was again not regenerated, consistent with issues #3–#8 on
   this branch: `mobile/openapi` already lacks the transcription models
   from those issues, so regenerating here would land six issues' worth of
