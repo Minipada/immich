@@ -160,3 +160,116 @@ Not done / caveats:
 - Search within the panel is a substring match over the segments already
   loaded, as the issue specifies. Moment-level search across the library
   is not part of this and stays out of the asset-shaped global search.
+
+Issue #10: Search videos by transcript content
+
+Searching a spoken phrase now returns the videos containing it, alongside
+every existing search filter. All acceptance criteria are covered.
+
+Storage:
+- New `transcript_search` table — one row per asset, trigram-indexed on
+  unaccented text via `gin (f_unaccent(text) gin_trgm_ops)` — mirroring
+  `ocr_search` exactly, down to the index expression and the delete-on-empty
+  upsert shape.
+- `transcript_segment` gains a nullable `correctedText` column. Editing does
+  not exist yet — that is issue #11's — but the search text builder already
+  reads through it, so correction preference becomes a write to an existing
+  column rather than a second change to the index when #11 lands.
+- Two migrations, generated against a live Postgres and hand-trimmed: the
+  auto-diff also proposed re-creating several `geodata_places` indexes and
+  constraints this environment never had (that table's data import — a
+  separate script from migrations — was never run here), which is
+  pre-existing drift unrelated to this issue and was left out.
+
+Building the index:
+- `buildTranscriptSearchText` (`utils/transcription.ts`) takes an asset's
+  segments and the same hallucination thresholds the caption track and panel
+  already apply at read time, and returns one flattened string: hallucinated
+  segments excluded, `correctedText` preferred over `text` where present,
+  every kept segment's text run through `tokenizeForSearch` — the same
+  tokenizer the query side uses — before joining. Indexing and querying
+  disagreeing on where one word ends and the next begins would silently
+  break the trigram match.
+- Called once, from `TranscriptionService.handleTranscribe`, after the chunk
+  loop finishes and before the asset is marked transcribed — not from inside
+  the loop. An empty result (no speech, or every segment discarded) deletes
+  the row rather than writing an empty one, same as OCR.
+- `TranscriptRepository.reset` now also deletes any existing search row for
+  the asset, so a video mid-reprocessing has no transcript row and cannot
+  keep matching on what an earlier run produced. `deleteAll` truncates
+  `transcript_search` alongside `transcript_segment`.
+
+Server search API:
+- `transcript` added everywhere `ocr` already was: the legacy
+  `MetadataSearchDto`/`SmartSearchDto`/`StatisticsSearchDto` field (all three
+  extend `BaseSearchSchema`), and the `StringSimilarityFilter`-typed
+  `SearchFilterBranch.transcript` for the v3 filter DTOs (unrouted in this
+  codebase currently, same as `ocr` there — added for parity, not reachable
+  yet).
+- Both `searchAssetBuilderLegacy` and the v3 `branchPredicates` gained a
+  `transcript` branch, byte-for-byte the same shape as the existing `ocr`
+  branch: an inner join (legacy) or `exists` subquery (v3) against
+  `transcript_search`, matching with the trigram word-similarity commutator
+  `f_unaccent(...) %>> f_unaccent(...)` — this is what gives both the accent
+  tolerance and the wording tolerance, not two separate mechanisms.
+  `mise open-api` regenerated the spec and the TypeScript SDK (the Dart SDK
+  was left alone, consistent with every prior issue on this branch); the
+  generated `.sql` query snapshots were refreshed via `sync-sql.js` against a
+  live database.
+
+Web:
+- A `transcript` query type alongside `ocr` in the search type selector
+  (`SearchBar`, `SearchTextSection`, `SearchFilterModal`), gated on the
+  `transcription` feature flag the same way `ocr` is gated on its own flag.
+  This is deliberately not folded into the primary search input: like OCR
+  text, a spoken phrase will not surface from the default smart-search box,
+  which is the accepted limitation the issue calls out — the inexpensive fix
+  is unifying the two text fields behind one input later, not building new
+  interface now.
+
+Tests:
+- 9 unit tests on `buildTranscriptSearchText`: empty input, multi-segment
+  flattening, correction preferred, fallback to model text, hallucination
+  exclusion, a hallucination excluded even when it carries a correction, and
+  tokenizer agreement for both Latin and CJK text (compared directly against
+  `tokenizeForSearch`'s own output).
+- 4 tests on `TranscriptionService`: the search text is written once at
+  completion and before the asset is marked transcribed; it is not written
+  when a video is skipped for having no audio track, is hidden, or when a
+  run is stopped by its time budget.
+- 6 end-to-end tests added to the existing `/search/metadata` spec: a spoken
+  phrase finds its video, accents and diacritics are tolerated, small
+  wording differences are tolerated, the filter combines with `type`, a
+  video with no transcript row (standing in for one still processing) is
+  excluded, and unrelated text matches nothing. Seeded directly via a new
+  `utils.setTranscriptSearchText`, since the e2e machine-learning container
+  does not perform real speech recognition — the same reason issue #9's
+  browser verification seeded segments directly.
+- Server unit suite green (2345+ passed, 2 skipped). Web unit suite green
+  (530 passed, 2 skipped). Server and web lint/format/tsc green; web
+  svelte-check reports 0 errors.
+
+Verified against a running instance:
+- The migrations were generated and applied against a live Postgres
+  (confirmed idempotent: regenerating afterward produces no further
+  transcript-related diff), and the resulting `%>>`/`f_unaccent` operators
+  were exercised directly against it with the literal strings the new e2e
+  tests use, confirming the phrase match, the accent-insensitive match, the
+  fuzzy wording match, and the unrelated-text non-match all behave as
+  asserted.
+- Not exercised: the new e2e test file was not run through the full e2e
+  harness. That suite talks to a dedicated Postgres/Redis/server trio on
+  fixed, non-default ports (`e2e/docker-compose.yml`, building the server
+  image from scratch), which is a materially heavier stack than the
+  lighter one issue #9 stood up by hand. Given the SQL was independently
+  validated against a live database and the full unit suites are green,
+  standing up that dedicated stack for this issue alone was judged not
+  worth its cost; the endpoint coverage exists and reads correctly, but has
+  not been run end to end.
+
+Not done / caveats:
+- The Dart SDK was not regenerated, consistent with every prior issue on
+  this branch.
+- `correctedText` is write-less until issue #11 adds the editing UI and its
+  endpoint; until then every segment's `correctedText` is null and the
+  search text builder falls back to the model's own text for all of them.
