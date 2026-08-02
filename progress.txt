@@ -528,3 +528,179 @@ Not done / caveats:
 - Nothing was found to fix in `checkSharedLinkAccess`, the auth guard, or
   the web client; the verification above exists to demonstrate that, not
   to describe a change to any of them.
+
+Issue #13: Administrator settings for transcription
+
+Administrators can now enable/disable transcription, choose the model,
+override the detected language (with an explicit automatic-detection
+option), and cap eligible video duration from the settings UI. Every other
+transcription knob — silence detection, chunk sizing, quality thresholds,
+timeout multiplier, thread count, confidence floor — stays configuration-only,
+exactly as the issue asks. All acceptance criteria are covered.
+
+The four fields:
+- `TranscriptionConfigSchema` gained `maxDuration: number | null`, seconds,
+  nullable for "no limit" — the only new field; `enabled`, `modelName` and
+  `language` already existed from issues #6–#8 and needed no schema change,
+  only a place to edit them.
+- Web: a `transcription` `SettingAccordion` in `MachineLearningSettings.svelte`,
+  inserted after `ocr` — same position in the settings list as the job queue
+  already orders it. `modelName` is a free-text field, not a dropdown, on the
+  CLIP precedent rather than the facial-recognition/OCR one: faster-whisper
+  model names are open-ended (`Systran/faster-whisper-<name>` on Hugging
+  Face), not a fixed small set like four face-recognition backbones.
+  `language` is a `SettingSelect` sourced from
+  `faster_whisper.tokenizer._LANGUAGE_CODES` (99 codes) with an "Automatic
+  detection" sentinel pinned at the top — the component's `value` prop can't
+  bind `null` directly (it's typed `string | number`), so the select is wired
+  one-way with an `onSelect` callback that maps the sentinel back to `null`
+  rather than using `bind:value`, the pattern every other field on this page
+  uses. `maxDuration` reuses `SettingInputField`'s existing `NUMBER` support
+  for `number | null`, which already treats an emptied field as "no limit"
+  with no code change needed beyond `required={false}`.
+
+Maximum duration, enforced:
+- `handleTranscribe` now reads `asset.duration` (already populated by
+  metadata extraction, in milliseconds — no ffprobe call needed) and compares
+  it against `machineLearning.transcription.maxDuration` right after the
+  hidden-asset check, before touching audio at all. Config is re-read fresh
+  per job (`getConfig({ withCache: true })`, invalidated on every admin save),
+  so a changed limit applies to the next queued job without a restart — the
+  seventh acceptance criterion is a property of the existing config-cache
+  design, not something built for this issue.
+- A video over the limit is marked exactly like the existing no-audio-track
+  case (`asset_job_status.transcribedAt` set, so non-forced bulk sweeps never
+  re-queue it): "not repeatedly re-examined" is the same mechanism issue #9
+  already established, reused rather than reinvented.
+- "The reason should be discoverable" needed one new thing the no-audio case
+  never had: a way to tell "skipped, too long" apart from an ordinary
+  completion, since both leave `transcribedAt` set. A new nullable
+  `asset_job_status.transcriptionMaxDurationExceeded` column and a
+  `TranscriptionStatus.SkippedMaxDuration` status value do that — checked
+  first in `getTranscriptionStatus`, so it takes priority over `transcribedAt`
+  being set. The transcript panel and the caption track's `NOTE` block both
+  already thread status through generically (issue #9's design), so both
+  surface the distinct reason for free once the status exists; the panel
+  gained one more branch on the existing three-way empty-state message
+  (`transcript_skipped_max_duration`) and the polling-stop condition, which
+  previously only checked for `Complete`, now also stops on this new terminal
+  status — otherwise a permanently-skipped video would poll forever.
+- The flag is cleared (`null`) by every path that begins a genuine attempt —
+  `TranscriptRepository.reset()` (shared by every fresh or resumed run) and
+  `deleteAll()` (the library-wide forced sweep) — so raising the limit and
+  re-running, forced, re-evaluates against the new value rather than staying
+  stuck on the old skip. This mirrors the same before-any-attempt clearing
+  the progress marker already gets in `reset()`, extended to cover the new
+  column via the same `upsertProgress` write.
+- Not excluded from forced bulk sweeps the way corrected assets are (issue
+  #11): the duration check re-runs on every attempt, forced or not, and is
+  cheap (a field comparison before any file I/O), so a forced sweep over an
+  asset still over the limit just re-skips it quickly rather than needing an
+  exclusion list.
+
+Migration:
+- One column, `asset_job_status.transcriptionMaxDurationExceeded boolean`,
+  generated and hand-verified against a live Postgres: running it and then
+  re-running `migrations:generate` produced only the pre-existing
+  `geodata_places` drift noted by every prior issue on this branch (that
+  table's import was never run in this environment), confirming the schema
+  file and the migration agree exactly.
+- `mise open-api` and `mise sql` were run by hand (`mise` itself isn't
+  installed here; the underlying `node dist/bin/sync-open-api.js`,
+  `oazapfts` via `npx`, and `node dist/bin/sync-sql.js` commands the tasks
+  wrap were run directly), regenerating the OpenAPI spec, the TypeScript SDK,
+  and the two changed `.sql` query snapshots
+  (`asset.job.repository.sql` gained `asset.duration` in the transcription
+  select; `transcript.repository.sql` gained the new column in `getStatus`
+  and its upsert). The Dart SDK was left alone, consistent with every prior
+  issue on this branch.
+
+Tests:
+- 6 new server unit tests on `handleTranscribe`: skips a too-long video,
+  marks it distinguishably from an ordinary completion, transcribes one at
+  exactly the limit, transcribes any duration when unset, re-evaluates a
+  previously-skipped video against a raised limit under `force`, and does not
+  write search text for the skipped case. Existing fixtures/config stubs
+  updated for the new required `maxDuration` field.
+- 1 new test on `getTranscript` (`asset.service.spec.ts`): reports the new
+  status distinctly from a real completion. 1 new test on
+  `getTranscriptionStatus`'s call sites confirmed via the above.
+- 4 new medium (real-database) tests on `TranscriptRepository`: `getStatus`
+  reports the flag, `reset` clears it, `deleteAll` clears it (both the
+  targeted case and folded into the existing "drop everything" assertions,
+  which needed updating for the new column's presence).
+- 2 new web tests on `TranscriptPanel`: the skipped-max-duration message
+  renders in the empty-segment state, and polling stops for it the same way
+  it already does for `Complete`.
+- Server unit suite green (2359 passed, 2 skipped, 94 files). Server medium
+  suite green for every file this issue touches
+  (`transcript.repository.spec.ts` 24/24, `asset-job.repository.spec.ts`
+  16/16); 24 failures elsewhere in that suite are pre-existing and unrelated
+  — a plugin-core WASM build gap (`extism-js` not installed in this
+  environment, so `immich-plugin-core` methods aren't registered) and
+  exif/ffprobe fixture gaps, neither touched by this issue. Web unit suite
+  green (539 passed, 2 skipped); the only two failures seen in a full run
+  were `AssetChangeDateModal`/`AssetSelectionChangeDateModal` timing out at
+  their default 5s limit, confirmed as pre-existing environmental flakes
+  (unrelated files, inconsistent failure sets across repeated runs, and
+  clearly a resource-contention symptom of this sandboxed host) by an
+  isolated rerun. Server lint/format/tsc green; web format, `check:svelte`
+  (0 errors) and `check:typescript` green. Web's full-project `eslint` could
+  not be made to finish cleanly in this environment — it reproducibly
+  crashes with a worker-thread `Atomics.wait` timeout inside
+  `eslint-plugin-better-tailwindcss`'s canonical-classes rule, on a different
+  untouched file each run (`AdminCard.svelte`, then `CalendarHeatmap.svelte`),
+  which is a resource-contention symptom of the same kind as the test flakes
+  above, not a defect in this change; `eslint` scoped to exactly the three
+  files this issue touched passed cleanly.
+
+Verified against a running instance:
+- Reused the postgres and valkey containers already running from prior
+  sessions (published ports; rootless Docker on this host makes container
+  IPs unreachable directly), still holding issue #9's seeded 3-minute video
+  with 24 transcript segments. The built server ran natively
+  (`IMMICH_WORKERS_INCLUDE=api`), same pre-existing reverse-geocoding gap in
+  the full microservices worker as every prior issue. The admin password was
+  reset with a raw bcrypt hash written directly to the `user` row (the CLI's
+  interactive prompt does not survive being piped, same reason prior issues
+  avoided it, and this sidesteps needing a working `CliService` bootstrap).
+- Confirmed by curl: `GET /system-config` returns the new `maxDuration` field
+  (default `null`); a `PUT` setting `maxDuration`, `language` and `modelName`
+  together round-trips correctly on a fresh `GET`, not just the echoed
+  response. Flipping `asset_job_status.transcriptionMaxDurationExceeded` to
+  `true` on the seeded asset (standing in for what a real over-limit job run
+  would write, since real inference isn't exercised in this environment —
+  the same limitation issues #9–#12 already noted) made `GET
+  .../transcript` report `status: "skippedMaxDuration"` and
+  `GET .../captions.vtt`'s `NOTE` block reflect it too, confirming the read
+  path end to end. Both were reverted afterward.
+- Confirmed by driving the browser: the Transcription accordion appears in
+  Machine Learning Settings, positioned after OCR; all four fields render
+  with the expected labels, descriptions and disabled state (correctly
+  greyed out while `machineLearning.enabled` was off, as this environment's
+  prior sessions had left it). With machine learning enabled, selecting
+  "French" and typing 600 into the duration field showed "Unsaved change"
+  badges on both, and Save cleared them — confirmed persisted with a fresh
+  page load and a direct `GET /system-config`, not just the optimistic UI
+  state. `machineLearning.enabled` and the transcription config were both
+  restored to their prior values afterward. The transcript panel on the
+  seeded video was not a useful surface to demonstrate the new skipped state
+  on: it already has 24 committed segments from being genuinely transcribed
+  in issue #9's verification, and the panel's skipped-state message only
+  displays when there are no segments to show (a real skip never gets any) —
+  this exact branch is what the new `TranscriptPanel.spec.ts` test asserts
+  directly and deterministically instead.
+
+Not done / caveats:
+- The Dart SDK was not regenerated, consistent with every prior issue on
+  this branch.
+- The candidate future setting the issue calls out — exposing the read-time
+  quality thresholds once real output has been seen — is explicitly deferred
+  by the issue itself and was not built.
+- Real inference and real job-queue execution were not exercised end to end,
+  for the reasons issues #9–#12 already documented (this environment's
+  microservices worker cannot bootstrap, and no real video file backs the
+  seeded asset); the duration gate's logic is covered by unit tests against
+  a mocked job pipeline and by medium tests against a real database, and its
+  effect on the read path was confirmed live by simulating the write a real
+  job would make.
