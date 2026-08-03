@@ -455,27 +455,32 @@
 
           <hr />
 
-          <SettingInputField
-            inputType={SettingInputFieldType.TEXT}
+          <SettingSelect
             label={$t('admin.machine_learning_transcription_model')}
+            desc={$t('admin.machine_learning_transcription_model_description')}
+            name="transcription-model"
             bind:value={configToEdit.machineLearning.transcription.modelName}
-            required={true}
+            options={[
+              { value: 'tiny', text: 'tiny (fastest, least accurate, multiple languages)' },
+              { value: 'tiny.en', text: 'tiny.en (fastest, least accurate, English only)' },
+              { value: 'base', text: 'base (fast, low accuracy, multiple languages)' },
+              { value: 'base.en', text: 'base.en (fast, low accuracy, English only)' },
+              { value: 'small', text: 'small (balanced speed and accuracy, multiple languages)' },
+              { value: 'small.en', text: 'small.en (balanced speed and accuracy, English only)' },
+              { value: 'medium', text: 'medium (slower, more accurate, multiple languages)' },
+              { value: 'medium.en', text: 'medium.en (slower, more accurate, English only)' },
+              { value: 'large-v3', text: 'large-v3 (most accurate, multiple languages, slowest)' },
+              {
+                value: 'large-v3-turbo',
+                text: 'large-v3-turbo (near large-v3 accuracy, much faster, multiple languages)',
+              },
+            ]}
             disabled={disabled ||
               !configToEdit.machineLearning.enabled ||
               !configToEdit.machineLearning.transcription.enabled}
             isEdited={configToEdit.machineLearning.transcription.modelName !==
               config.machineLearning.transcription.modelName}
-          >
-            {#snippet descriptionSnippet()}
-              <p class="pb-2 text-sm immich-form-label">
-                <FormatMessage key="admin.machine_learning_transcription_model_description">
-                  {#snippet children({ message })}
-                    <a target="_blank" href="https://huggingface.co/Systran"><u>{message}</u></a>
-                  {/snippet}
-                </FormatMessage>
-              </p>
-            {/snippet}
-          </SettingInputField>
+          />
 
           <SettingSelect
             label={$t('admin.machine_learning_transcription_language')}

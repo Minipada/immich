@@ -33,7 +33,7 @@ Additional actions available on a video's transcript:
 Machine Learning Settings has a **Transcription** section with:
 
 - **Enable transcription** — if disabled, videos are never transcribed regardless of the settings below.
-- **Transcription model** — the name of a [faster-whisper](https://huggingface.co/Systran) model. Larger models are slower and use more memory but produce better results.
+- **Transcription model** — a [faster-whisper](https://huggingface.co/Systran) model, chosen from a list ordered from fastest to most accurate (`tiny` through `large-v3-turbo`). Models without an `.en` suffix understand multiple languages and can tell them apart within a single video; `.en` models are English-only but slightly more accurate for English.
 - **Language** — the language to assume for every video in the library, or automatic per-video detection. Forcing a language when only one is ever spoken turns misdetection from unlikely into impossible.
 - **Maximum video duration** — videos longer than this are never transcribed and are not re-examined by future transcription jobs, to bound worst-case processing time on very long videos. Leave blank for no limit.
 
